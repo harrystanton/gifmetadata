@@ -37,17 +37,20 @@ const unsigned char comment_extension[] = { 0x21, 0xfe };
 
 int all_flag = 0;
 int verbose_flag = 0;
+int scrub_flag = 0;
 
 int output_comments = 1;
 
 // file buffer
 unsigned char *buf;
 
-// have written comments to output
+// w_ are write variables
 int w_comments = 0;
 int w_chunk_i = 0;
 FILE *w_out = NULL;
 cli_flag_arg *comment_flags = NULL;
+
+int w_skip = 0;
 
 void extension_cb(gifmetadata_state *s, gifmetadata_extension_info *extension) {
     if (extension == NULL)
@@ -74,41 +77,58 @@ void extension_cb(gifmetadata_state *s, gifmetadata_extension_info *extension) {
     free(extension);
 }
 
+// write a chunk one byte before the current state index
+void write_chunk(gifmetadata_state *s) {
+    int total_bytes = s->chunk_i - w_chunk_i;
+    if (w_out != NULL && total_bytes > 0) {
+        // write to before the current byte
+        // no need to minus one as index starts at zero
+        if (!w_skip)
+            fwrite(s->chunk+w_chunk_i, 1, total_bytes, w_out);
+        w_chunk_i = s->chunk_i;
+    }
+}
+
 void state_cb(gifmetadata_state *s, enum gifmetadata_read_state state) {
     // state is called on the exact byte of first encounter
 
-    int write_comment = w_out != NULL && comment_flags != NULL && state != searching && state > global_color_table && !w_comments;
-    if (!write_comment) {
-        return;
-    }
-
-    if (s->chunk_i > 0) {
-        // write to before the current byte
-        // no need to minus one as index starts at zero
-        fwrite(s->chunk, 1, s->chunk_i, w_out);
+    // code for skipping the comment bytes on scrubbing, relies on listening
+    // for "known_extension" state then skipping bytes until the state changes
+    if (w_skip) {
+        // disable skipping and get the write index caught up
+        w_skip = 0;
         w_chunk_i = s->chunk_i;
     }
 
-    cli_flag_arg *comment = comment_flags;
-    while (comment != NULL) {
-        fwrite(&comment_extension, 1, sizeof(comment_extension), w_out);
-        unsigned char len;
-        if (comment->string_len > 255) {
-            fprintf(stderr, "WARNING Comment length is longer than 255 characters, this is may cause incompatibility issues\n");
-            len = 255;
-        } else {
-            len = (unsigned char)comment->string_len;
-        }
-        fwrite(&len, 1, 1, w_out);
-        fwrite(comment->string, 1, comment->string_len, w_out);
-        fputc(0, w_out);
+    int write_comment = w_out != NULL && comment_flags != NULL && state != searching && state > global_color_table && !w_comments;
+    if (write_comment) {
+        write_chunk(s);
 
-        comment = comment->next;
+        cli_flag_arg *comment = comment_flags;
+        while (comment != NULL) {
+            fwrite(&comment_extension, 1, sizeof(comment_extension), w_out);
+            unsigned char len;
+            if (comment->string_len > 255) {
+                fprintf(stderr, "WARNING Comment length is longer than 255 characters, this is may cause incompatibility issues\n");
+                len = 255;
+            } else {
+                len = (unsigned char)comment->string_len;
+            }
+            fwrite(&len, 1, 1, w_out);
+            fwrite(comment->string, 1, comment->string_len, w_out);
+            fputc(0, w_out);
+
+            comment = comment->next;
+        }
+        w_comments = 1; 
+    } else if (scrub_flag && state == extension) {
+        write_chunk(s);
+    } else if (scrub_flag && state == known_extension) {
+        w_skip = s->local_extension_type == comment;
     }
-    w_comments = 1; 
 }
 
-// TODO gif comment scrubbing
+// TODO support msoft gif animator "trailing comments", see gifX.gif
 int main(int argc, char **argv) {
     cli_user_args *args = cli_new_user_args();
     if (args == NULL) {
@@ -147,13 +167,26 @@ int main(int argc, char **argv) {
     }
 
     if (args->help_flag) {
-        printf("gifcomment [-h] [-a] [-v] [-d] [-c <comment>] [-o <output>] [input]\n");
+        printf("gifcomment [-hsavd] [-c <comment>] [-o <output>] [input]\n");
+        printf("\nRead and write comments within a GIF file.\n");
+        printf("\nBy default stdin will be captured and comments will be outputted to stdout, upon\n");
+        printf("any modifications the new GIF will be outputted to stdout. Providing an optional\n");
+        printf("input or using the -o option will override this behaviour.\n");
+        printf("\n");
+        printf("    -h              Display help\n");
+        printf("    -s              Scrub all existing comments\n");
+        printf("    -a              Display all extension data\n");
+        printf("    -v              Verbose mode\n");
+        printf("    -d              Debug mode\n");
+        printf("    -c <comment>    Prepend a comment to the gif\n");
+        printf("    -o <output>     Output modified GIF to file\n");
         cli_free_user_args(args);
         return 0;
     }
 
     verbose_flag = args->verbose_flag;
     all_flag = args->all_flag;
+    scrub_flag = args->scrub_flag;
 
     // configuring the file for reading
     if (args->output_flag != NULL && args->output_flag->string != NULL) {
@@ -165,12 +198,13 @@ int main(int argc, char **argv) {
         output_comments = 0;
     }
 
-    if (args->comment_flags != NULL) {
+    if (args->comment_flags != NULL || args->scrub_flag) {
         if (w_out == NULL) {
             w_out = stdout;
         }
         output_comments = 0;
-        comment_flags = args->comment_flags;
+        if (args->comment_flags != NULL)
+            comment_flags = args->comment_flags;
     }
 
     FILE *f;
@@ -233,7 +267,7 @@ int main(int argc, char **argv) {
         total_b += b;
 
         // before the next loop, write remaining
-        if (w_out != NULL) {
+        if (w_out != NULL && !w_skip) {
             fwrite(buf+w_chunk_i, 1, b-w_chunk_i, w_out);
         }
     }

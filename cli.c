@@ -112,6 +112,9 @@ int cli_parse(cli_user_args *a, int argc, char **argv) {
                 case 'd':
                     a->debug_flag = 1;
                     break;
+                case 's':
+                    a->scrub_flag = 1;
+                    break;
                 case 'c':
                     awaiting_flag_arg = new_cli_flag_arg();
                     if (awaiting_flag_arg == NULL) {

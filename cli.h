@@ -42,6 +42,7 @@ typedef struct cli_user_args {
     int verbose_flag;
     int debug_flag;
     int help_flag;
+    int scrub_flag;
     cli_flag_arg *comment_flags;
     cli_flag_arg *output_flag;
 
