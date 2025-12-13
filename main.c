@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
     }
 
     if (args->help_flag) {
-        printf("gifcomment [-hsavd] [-c <comment>] [-o <output>] [input]\n");
+        printf("gifmetadata [-hsavd] [-c <comment>] [-o <output>] [input]\n");
         printf("\nRead and write comments within a GIF file.\n");
         printf("\nBy default stdin will be captured and comments will be outputted to stdout, upon\n");
         printf("any modifications the new GIF will be outputted to stdout. Providing an optional\n");

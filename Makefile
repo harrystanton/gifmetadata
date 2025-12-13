@@ -4,10 +4,10 @@ CFLAGS=-std=gnu99 -Wall
 #CFLAGS=-fsanitize=address -Wall
 LIBS=-lm
 
-TARGET=gifcomment
+TARGET=gifmetadata
 LIBTARGET=libgifmetadata.a
 
-OBJS = gifcomment.o cli.o
+OBJS = main.o cli.o
 LIBOBJS = gifmetadata.o gif.o
 
 all: $(TARGET)
