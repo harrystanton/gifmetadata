@@ -1,126 +1,326 @@
-// MIT License
-// 
-// Copyright (c) 2022 Harry Stanton
-// 
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-// 
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
-// gifmetadata
-// version 0.0.1
-//
-// Harry Stanton <harry@harrystanton.com>
-//
-// designed to
-//     1. be fast
-//     2. be grep able
-//     3. use little memory
-//     4. be conservative with libraries
-//
-// understanding of how gifs work comes from
-//     http://giflib.sourceforge.net/whatsinagif/bits_and_bytes.html
-// and
-//     https://www.w3.org/Graphics/GIF/spec-gif89a.txt
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
 
 #include "cli.h"
-#include "gif.h"
+#include "gifmetadata.h"
+
+#define EXIT_IO_ERROR 2
+#define EXIT_MEM_ERROR 3
+#define EXIT_PARSE_ERROR 4
+
+#define CHUNK_SIZE 2048
+
+// understanding of how gifs work comes from
+//     http://giflib.sourceforge.net/whatsinagif/bits_and_bytes.html
+// and
+//     https://www.w3.org/Graphics/GIF/spec-gif89a.txt
+
+const unsigned char comment_extension[] = { 0x21, 0xfe };
 
 int all_flag = 0;
+int verbose_flag = 0;
+int scrub_flag = 0;
 
-void extension_callback(struct extension_info *extension) {
+int output_comments = 1;
+
+// file buffer
+unsigned char *buf;
+
+// w_ are write variables
+int w_comments = 0;
+int w_chunk_i = 0;
+FILE *w_out = NULL;
+cli_flag_arg *comment_flags = NULL;
+
+int w_skip = 0;
+
+void extension_cb(gifmetadata_state *s, gifmetadata_extension_info *extension) {
+    if (extension == NULL)
+        return;
     if (all_flag) {
         switch (extension->type) {
         case plain_text:
-            printf("plain text: %s\n", extension->buffer);
+            printf("Plain text: %s\n", extension->buffer);
             break;
         case application:
-            printf("application: %s (%ld bytes)\n", extension->buffer, extension->buffer_len);
+            printf("Application: %s (%ld bytes)\n", extension->buffer, extension->buffer_len);
             break;
         case application_subblock:
-            printf("application sub-block (%ld bytes)\n", extension->buffer_len);
+            printf("Application sub-block (%ld bytes)\n", extension->buffer_len);
             break;
         case comment:
-            printf("comment: %s (%ld bytes)\n", extension->buffer, extension->buffer_len);
+            printf("Comment: %s (%ld bytes)\n", extension->buffer, extension->buffer_len);
         }
-    } else {
+    } else if (output_comments) {
         if (extension->type == comment) {
             printf("%s\n", extension->buffer);
         }
     }
+    free(extension);
 }
 
+// write a chunk one byte before the current state index
+void write_chunk(gifmetadata_state *s) {
+    int total_bytes = s->chunk_i - w_chunk_i;
+    if (w_out != NULL && total_bytes > 0) {
+        // write to before the current byte
+        // no need to minus one as index starts at zero
+        if (!w_skip)
+            fwrite(s->chunk+w_chunk_i, 1, total_bytes, w_out);
+        w_chunk_i = s->chunk_i;
+    }
+}
+
+void state_cb(gifmetadata_state *s, enum gifmetadata_read_state state) {
+    // state is called on the exact byte of first encounter
+
+    // code for skipping the comment bytes on scrubbing, relies on listening
+    // for "known_extension" state then skipping bytes until the state changes
+    if (w_skip) {
+        // disable skipping and get the write index caught up
+        w_skip = 0;
+        w_chunk_i = s->chunk_i;
+    }
+
+    int write_comment = w_out != NULL && comment_flags != NULL && state != searching && state > global_color_table && !w_comments;
+    if (write_comment) {
+        write_chunk(s);
+
+        cli_flag_arg *comment = comment_flags;
+        while (comment != NULL) {
+            //
+            // NOTE: comment->string_len is null terminated but gif
+            // comments aren't so '- 1' is needed
+            //
+            fwrite(&comment_extension, 1, sizeof(comment_extension), w_out);
+            unsigned char len;
+            if (comment->string_len > 256) {
+                fprintf(stderr, "WARNING Comment length is longer than 255 characters, this is may cause incompatibility issues\n");
+                len = 255;
+            } else {
+                len = (unsigned char)comment->string_len - 1;
+            }
+            fwrite(&len, 1, 1, w_out);
+            fwrite(comment->string, 1, comment->string_len-1, w_out);
+            fputc(0, w_out);
+
+            comment = comment->next;
+        }
+        w_comments = 1; 
+    } else if (scrub_flag && state == extension) {
+        write_chunk(s);
+    } else if (scrub_flag && state == known_extension) {
+        w_skip = s->local_extension_type == comment;
+    }
+}
+
+// TODO support msoft gif animator "trailing comments", see gifX.gif
 int main(int argc, char **argv) {
+    int status = 0;
 
-    struct cli_args *args = cli_parse(argc, argv);
-    // returns null when handled e.g. help
-    if (args == NULL)
-        return 0;
-    
+    // to free
+    cli_user_args *args = NULL;
+    gifmetadata_state *gifmetadata_s = NULL;
+
+    args = cli_user_args_new();
+    if (args == NULL) {
+        fprintf(stderr, "ERROR Failed to allocate user arguments\n");
+        status = EXIT_MEM_ERROR;
+        goto exit;
+    }
+
+    int cli_status = cli_parse(args, argc, argv);
+    char invalid_flag = args->invalid_flag;
+    switch (cli_status) {
+    case CLI_SUCCESS:
+        break;
+    case CLI_INVALID_FLAG:
+        fprintf(stderr, "ERROR Invalid flag '%c'\n", invalid_flag);
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    case CLI_ALLOC_FAILURE:
+        fprintf(stderr, "ERROR Memory alloc failure\n");
+        status = EXIT_MEM_ERROR;
+        goto exit;
+    case CLI_EXCEEDS_ARG_MAX_LEN:
+        fprintf(stderr, "ERROR Argument exceeds the maximum length of %d characters\n", CLI_ARG_MAX_LEN);
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    case CLI_MULTIPLE_INPUTS:
+        fprintf(stderr, "ERROR More than one input file provided\n");
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    case CLI_MULTIPLE_OUTPUTS:
+        fprintf(stderr, "ERROR More than one output file provided\n");
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    case CLI_MISSING_FLAG_ARG:
+        fprintf(stderr, "ERROR Flag '%c' is missing an argument\n", invalid_flag);
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    default:
+        fprintf(stderr, "ERROR Unknown error\n");
+        status = EXIT_PARSE_ERROR;
+        goto exit;
+    }
+
+    if (args->help_flag) {
+        printf("gifmetadata [-hsavd] [-c <comment>] [-o <output>] [input]\n");
+        printf("\nRead and write comments within a GIF file.\n");
+        printf("\nBy default stdin will be captured and comments will be outputted to stdout, upon\n");
+        printf("any modifications the new GIF will be outputted to stdout. Providing an optional\n");
+        printf("input or using the -o option will override this behaviour.\n");
+        printf("\n");
+        printf("    -h              Display help\n");
+        printf("    -s              Scrub all existing comments\n");
+        printf("    -a              Display all extension data\n");
+        printf("    -v              Verbose mode\n");
+        printf("    -d              Debug mode\n");
+        printf("    -c <comment>    Prepend a comment to the gif\n");
+        printf("    -o <output>     Output modified GIF to file\n");
+        goto exit;
+    }
+
+    verbose_flag = args->verbose_flag;
     all_flag = args->all_flag;
+    scrub_flag = args->scrub_flag;
 
-    if (args->dev_flag) {
-        printf("[dev] dev flag active\n");
-        if (args->verbose_flag) {
-            printf("[dev] verbose flag active\n");
+    // configuring the file for reading
+    if (args->output_flag != NULL && args->output_flag->string != NULL) {
+        w_out = fopen(args->output_flag->string, "wb");
+        if (w_out == NULL) {
+            fprintf(stderr, "ERROR Failed to open output file for writing\n");
+            status = EXIT_IO_ERROR;
+            goto exit;
+        }
+        output_comments = 0;
+    }
+
+    if (args->comment_flags != NULL || args->scrub_flag) {
+        if (w_out == NULL) {
+            w_out = stdout;
+        }
+        output_comments = 0;
+        if (args->comment_flags != NULL)
+            comment_flags = args->comment_flags;
+    }
+
+    FILE *f;
+    if (args->filename == NULL) {
+        f = stdin;
+    } else {
+        if (access(args->filename, F_OK) != 0) {
+            fprintf(stderr, "ERROR File '%s' cannot be accessed\n", args->filename);
+            status = EXIT_IO_ERROR;
+            goto exit;
+        }
+        
+        f = fopen(args->filename, "rb");
+        if (f == NULL) {
+            fprintf(stderr, "ERROR Failed to open file '%s'\n", args->filename);
+            status = EXIT_IO_ERROR;
+            goto exit;
         }
     }
-    
-    if (args->filename == NULL) {
-        fprintf(stderr, "[error] you never specified a file to open\n");
-        free_cli_args(args);
-        return 1;
+
+    // configure gif parsing state
+    gifmetadata_s = gifmetadata_state_new();
+    if (gifmetadata_s == NULL) {
+        fprintf(stderr, "ERROR Failed to allocate state memory\n");
+        status = EXIT_MEM_ERROR;
+        goto exit;
     }
 
-    FILE *fileptr;
-    
-    if (access(args->filename, F_OK) != 0) {
-        fprintf(stderr, "[error] file '%s' cannot be accessed\n", args->filename);
-        free_cli_args(args);
-        return 1;
+    // read file chunk by chunk
+    unsigned char *buf = malloc(CHUNK_SIZE);
+    if (buf == NULL) {
+        fprintf(stderr, "ERROR Buffer memory alloc failure\n");
+        status = EXIT_MEM_ERROR;
+        goto exit;
     }
-    
-    fileptr = fopen(args->filename, "rb");
 
-    enum read_gif_file_status gif_status = read_gif_file(fileptr, &extension_callback, NULL, args->verbose_flag, args->dev_flag);
-    if (gif_status > 0) {
-        switch (gif_status) {
-        case GIF_FILE_INVALID_SIG:
-            fprintf(stderr, "[error] file is an unsupported gif version\n");
+    size_t total_b = 0;
+    size_t b;
+    int parse_status;
+    while ((b = fread(buf, 1, CHUNK_SIZE, f)) != 0) {
+        w_chunk_i = 0;
+        parse_status = gifmetadata_parse_gif(gifmetadata_s, buf, b, &extension_cb, &state_cb);
+        switch (parse_status) {
+        case GIFMETADATA_SUCCESS:
             break;
-        case GIF_FILE_COMMENT_EXCEEDS_BOUNDS:
-            fprintf(stderr, "[error] file contains an invalid comment\n");
+        case GIFMETADATA_INVALID_SIG:
+            fprintf(stderr, "ERROR Unsupported GIF version (invalid signature)\n");
+            status = EXIT_PARSE_ERROR;
+            goto exit;
+        case GIFMETADATA_COMMENT_EXCEEDS_BOUNDS:
+            fprintf(stderr, "ERROR Comment exceeds maximum comment length\n");
+            status = EXIT_PARSE_ERROR;
+            goto exit;
+        case GIFMETADATA_ALLOC_FAILURE:
+            fprintf(stderr, "ERROR Failed to allocate memory\n");
+            status = EXIT_MEM_ERROR;
+            goto exit;
+        default:
+            fprintf(stderr, "ERROR Unknown error\n");
+            status = EXIT_PARSE_ERROR;
+            goto exit;
+        }
+        total_b += b;
+
+        // before the next loop, write remaining
+        if (w_out != NULL && !w_skip) {
+            fwrite(buf+w_chunk_i, 1, b-w_chunk_i, w_out);
+        }
+    }
+
+    if (ferror(f) != 0) {
+        fclose(f);
+        fprintf(stderr, "ERROR Error reading input file\n"); 
+        status = EXIT_IO_ERROR;
+        goto exit;
+    }
+
+    fclose(f);
+
+    if (total_b == 0) {
+        fprintf(stderr, "ERROR Empty file\n");
+        status = EXIT_IO_ERROR;
+        goto exit;
+    }
+    if (gifmetadata_s->gif_version == 0) {
+        fprintf(stderr, "ERROR Invalid GIF file (missing signature)\n");
+        status = EXIT_IO_ERROR;
+        goto exit;
+    }
+    // check for unexpected eof
+    if (gifmetadata_s->read_state != trailer) {
+        // non-fatal status code
+        fprintf(stderr, "WARNING Unexpected end of file\n");
+    }
+
+    if (verbose_flag) {
+        fprintf(stderr, "VERBOSE GIF version: ");
+        switch (gifmetadata_s->gif_version) {
+        case gif87a:
+            fprintf(stderr, "87a\n");
+            break;
+        case gif89a:
+            fprintf(stderr, "89a\n");
             break;
         default:
-            fprintf(stderr, "[error] unhandled gif state\n");
-            break;
+            fprintf(stderr, "unknown (%d)\n", gifmetadata_s->gif_version);
         }
-    } else {
-        if (args->dev_flag)
-            printf("[dev] finished reading image\n");
-    }
-    
-    fclose(fileptr);
-    free_cli_args(args);
 
-    return gif_status;
+        fprintf(stderr, "VERBOSE File size: %ld bytes\n", total_b);
+        fprintf(stderr, "VERBOSE Canvas width: %d\n", gifmetadata_s->canvas_width);
+        fprintf(stderr, "VERBOSE Canvas height: %d\n", gifmetadata_s->canvas_height);
+    }
+
+exit:
+    if (args != NULL) cli_user_args_free(args);
+    if (gifmetadata_s != NULL) gifmetadata_state_free(gifmetadata_s);
+    return status;
 }
 

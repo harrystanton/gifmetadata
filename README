@@ -1,0 +1,77 @@
+gifmetadata
+
+  CLI tool and C library for reading and writing lesser-known GIF 
+  comments.
+
+  The GIF image format allows plain text comments to be embedded,
+  while tools initially provided support it has since fell out of
+  favor (with the exception of GIMP). Inspecting the comments of
+  older GIFs reveals a large amount of context not previously
+  understood while writing comments allows artists to sign and
+  license their works.
+
+  gifmetadata is the name of both the tool and the library, the
+  former using the latter serving as a fleshed-out example of usage.
+  The library operates on a callback stream model deferring when any
+  GIF metadata is found, it is the responsibility of the program to
+  determine or discard callback data appropriately. The library does
+  not provide the ability to write comments, only providing trivial 
+  means to do so as can be seen in the tool's example code.
+
+  https://yarrie.net/gifmetadata
+
+Usage
+
+  gifmetadata [-hsavd] [-c <comment>] [-o <output>] [input]
+
+  By default stdin will be captured and comments will be outputted to
+  stdout. Only upon modification will a new GIF file be outputted to
+  stdout, providing an optional input or output file will override
+  this behavior.
+
+    Argument        Description
+
+    -h              Display help information.
+
+    -c <comment>    Prepend a comment to the GIF, multiple can be
+                    used in sequence. GIF specification requires that
+                    comments be no more than 255 characters, doing so
+                    will produce a warning but not truncation.
+
+    -o <output>     Output modified GIF to file instead of stdout.
+
+    -s              Scrub all existing comments from the file, 
+                    excluding any new ones specified.
+
+    -a              Display all extension data (for advanced users).
+
+    -v              Verbose mode containing GIF version, file size, 
+                    and width/height information.
+
+    -d              Debug mode.
+
+Building
+
+  Building the project requires a C compiler and the Make utility. 
+
+  Running make in the project's root will produce the gifmetadata
+  tool and the libgifmetadata.a library.
+
+License
+
+  This program is licensed under CC0-1.0, marked as dedicated to the
+  public domain, see LICENSE file.
+
+Contributing
+
+  Please email any feedback or patches to yarrie@yarrie.net, I cherish
+  all correspondence.
+
+Credit
+
+  Thank you to the developers of GIFLIB for their excellent
+  documentation of the GIF file format which makes for great further
+  reading.
+
+  http://giflib.sourceforge.net/whatsinagif/bits_and_bytes.html
+

@@ -1,0 +1,7 @@
+* Support for Microsoft's GIF Animator "trailing comments," that is
+  comments that exist just before the GIF trailer byte, dee gifX.gif
+  [2026-02-10].
+* Complete library documentation [2026-02-10].
+* Further testing in the rare chance of a false "invalid signature"
+  or "unexpected end of file," is that the fault of the parser or
+  the file? [2026-02-10]

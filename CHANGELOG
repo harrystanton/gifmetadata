@@ -1,0 +1,10 @@
+0.1.0 - 2026-02-10
+
+* gifmetadata tool can now write comments.
+* Tool and library code now separated under main.c and gifmetadata.c respectively.
+* Reworked the arguments syntax to work around stdout and stdin by default, overridable
+  by providing input and output arguments.
+* Makefile now compatible with BSD make.
+* Complete README.
+* Rewrote the CLI flag parser to be hardcoded at compile time instead of a dynamic list.
+* Unified status codes.

@@ -1,399 +1,307 @@
-#include "gif.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
 
-// lsd = local screen descriptor
-enum lsd_state {
-    width,
-    height,
-    packed,
-    bg_color,
-    pixel_aspect_ratio
-};
+#include "gifmetadata.h"
 
-const char gif_sig[] = { 'G', 'I', 'F' };
-const char gif_87a[] = { '8', '7', 'a'};
-const char gif_89a[] = { '8', '9', 'a'};
+// IMPORTANT this should be called as it encounters the byte, not pre-emptively
+#define CALL_STATE_CB(cb, s) if (cb != NULL) cb(s, s->read_state)
 
-enum read_gif_file_status read_gif_file(FILE *file, void (*extension_cb)(struct extension_info*), void (*state_cb)(enum file_read_state), int verbose_flag, int dev_flag) {
-    fseek(file, 0, SEEK_END);
-    size_t filelen = ftell(file);
-    rewind(file);
-    
-    // if (verbose_flag)
-        // printf("[verbose] opened file '%s'\n", args->filename);
-    
-    if (verbose_flag)
-        printf("[verbose] file size: %ld bytes\n", filelen);
+const char gif_sig[] = { 'G', 'I', 'F', '8', 'x', 'a' };
 
-    // step 1: check file is a gif
-    if (6 > filelen) {
-        return GIF_FILE_INVALID_SIG;
-    }
-    
-    // program reads the file in 256 chunks, and then requests
-    // more if it needs them
-    
-    enum file_read_state state = header;
-    unsigned char buffer[256];
-    
-    int color_table_len = 0;
-    
-    // scratchpad is a buffer used for misc reading/writing
-    // while traversing thru the gif. 256 is enough since
-    // the size as given by gif blocks can only be represented
-    // in an unsigned char.
-    unsigned char *scratchpad = malloc(sizeof(unsigned char) * SCRATCHPAD_CHUNK_SIZE);
-    // allocated size of the buffer
-    size_t scratchpad_size = SCRATCHPAD_CHUNK_SIZE;
-    // i is max index of written data in the buffer
-    int scratchpad_i = 0;
-    // len is the expected length to write into the buffer according
-    // to an unsigned char that prefixes data in the GIF data, can
-    // be inaccurate for comments because some applications overloaded
-    // comment data
-    int scratchpad_len = 0;
-    
-    // local screen descriptor
-    enum lsd_state local_lsd_state;
-    enum extension_type local_extension_type;
+int gifmetadata_parse_gif(
+    gifmetadata_state *s,
+    unsigned char *chunk,
+    size_t chunk_len,
+    void (*extension_cb)(gifmetadata_state*, gifmetadata_extension_info*),
+    void (*state_cb)(gifmetadata_state*, enum gifmetadata_read_state)) {
 
-    int bytes_to_read;
+    s->chunk = chunk;
+    s->chunk_len = chunk_len;
 
-    struct extension_info *extension_cb_info;
-    if (extension_cb != NULL)
-        extension_cb_info = malloc(sizeof(struct extension_info));
+    for (int i = 0; i < chunk_len; i++) {
+        s->file_i++;
+        unsigned char byte = chunk[i];
+        s->chunk_i = i;
+       
+        if (s->read_state == header) {
+            // loading header bytes into scratchpad until complete
+            s->scratchpad[s->scratchpad_i++] = byte;
+            if (s->scratchpad_i > 6) {
 
-    while ((bytes_to_read = fread(buffer, sizeof(unsigned char), 256, file)) > 0) {
-        int i = 0;
-        
-        // safe to assume that magic numbers fit in
-        // a full 256 chunk bcs its at the start of
-        // a file
-        if (state == header) {
-
-            const size_t gif_sig_len = sizeof(gif_sig);
-            for (i = 0; i < gif_sig_len; i++) {
-                if (buffer[i] != gif_sig[i]) {
-                    free(scratchpad);
-                    free(extension_cb_info);
-                    return GIF_FILE_INVALID_SIG;
-                }
-            }
-
-            char unsupported_version = 0;
-            for (i = 0; i < 3; i++) {
-                if (buffer[i+gif_sig_len] != gif_87a[i] && buffer[i+gif_sig_len] != gif_89a[i]) {
-                    unsupported_version = 1;
-                    break;
-                }
-            }
-            // pushing i past the sig (length of 6)
-            i = 6;
-            
-            if (verbose_flag) {
-                if (buffer[3] == '8') {
-                    if (buffer[4] == '7') {
-                        printf("[verbose] gif is version 87a\n");
-                    } else if (buffer[4] == '9') {
-                        printf("[verbose] gif is version 89a\n");
+                unsigned char sig_byte;
+                for (int j = 0; j < 6; j++) {
+                    sig_byte = s->scratchpad[j];
+                    if (j == 4) {
+                        if (sig_byte == 0x37)
+                            s->gif_version = gif87a;
+                        else if (sig_byte == 0x39)
+                            s->gif_version = gif89a;
+                        else
+                            return GIFMETADATA_INVALID_SIG;
+                    } else if (sig_byte != gif_sig[j]) {
+                        return GIFMETADATA_INVALID_SIG; 
                     }
                 }
+
+                s->scratchpad_i = 0;
+                s->read_state = logical_screen_descriptor;
+                // next byte will be the lsd
+                s->local_lsd_state = 0;
             }
-            if (unsupported_version) {
-                fprintf(stderr, "[warning] gif is an unsupported version: ");
-                for (i = sizeof(gif_sig); i < 6; i++) {
-                    fprintf(stderr, "%c", buffer[i]);
-                }
-                fprintf(stderr, "\n");
-            }
-            state = logical_screen_descriptor;
-            local_lsd_state = 0;
         }
         
-        for (; i < bytes_to_read; i++) {
-            switch (state) {
-            case logical_screen_descriptor:
-                
-                switch (local_lsd_state) {
-                case width:
-                case height:
-                    scratchpad[scratchpad_i] = buffer[i];
-                    scratchpad_i++;
-                    if (scratchpad_i >= 2) {
-                        int result = scratchpad[0] + (scratchpad[1] << 8);
-                        if (local_lsd_state == width) {
-                            if (verbose_flag)
-                                printf("[verbose] canvas width: %d\n", result);
-                            scratchpad_i = 0;
-                            local_lsd_state = height;
-                        } else {
-                            if (verbose_flag)
-                                printf("[verbose] canvas height: %d\n", result);
-                            scratchpad_i = 0;
-                            local_lsd_state = packed;
-                        }
-                    }
-                    break;
-                case packed: {
-                    int color_resolution = ((buffer[i] & 0b1000000) >> 4) + ((buffer[i] & 0b100000) >> 4) + ((buffer[i] & 0b10000) >> 4);
-                    color_table_len = 3 * pow(2, color_resolution+1);
-                    
-                    if (dev_flag)
-                        printf("[dev] color depth is: %d, len is: %d\n", color_resolution, color_table_len);
-                    if ((buffer[i] & 0b10000000) == 0b10000000) {
-                        // global color table
-                        if (dev_flag)
-                            printf("[dev] has a global color table\n");
-                        
-                        int color_table_size = (buffer[i] & 0b100) + (buffer[i] & 0b10) + (buffer[i] & 0b1);
-                        color_table_len = 3 * pow(2, color_table_size+1);
-                        if (dev_flag)
-                            printf("[dev] color table size: %d, len: %d\n", color_table_size, color_table_len);
-                        
-                        
-                        // use the scratchpad index as color table
-                        // index
-                        scratchpad_i = 0;
-                        state = global_color_table;
+        switch (s->read_state) {
+        case logical_screen_descriptor:
+            CALL_STATE_CB(state_cb, s); 
+            switch (s->local_lsd_state) {
+            case width:
+            case height:
+                s->scratchpad[s->scratchpad_i++] = byte;
+                if (s->scratchpad_i >= 2) {
+                    uint16_t result = s->scratchpad[0] | (s->scratchpad[1] << 8);
+                    s->scratchpad_i = 0;
+
+                    if (s->local_lsd_state == width) {
+                        s->canvas_width = result;
+                        s->local_lsd_state = height;
                     } else {
-                        state = searching;
+                        s->canvas_height = result;
+                        s->local_lsd_state = packed;
                     }
+                }
+                break;
+            case packed:
+                s->global_color_table_flag = byte >> 7 & 1;
+
+                if (s->global_color_table_flag) {
+                    s->color_resolution = (byte >> 4) & 0b111;
+                    s->color_table_size = byte & 0b111;
+                    s->color_table_len = 3 * pow(2, s->color_table_size+1);
                     
-                    break;
-                    }
-                default:
-                    break;
+                    // use the scratchpad index as color table index
+                    s->scratchpad_i = 0;
+                    s->read_state = global_color_table;
+                } else {
+                    s->read_state = searching;
                 }
                 
-                break;
-            case global_color_table:
-                if (color_table_len < scratchpad_i) {
-                    if (dev_flag)
-                        printf("[dev] finished the glboal color table\n");
-                    state = searching;
-                }
-                scratchpad_i++;
-                break;
-            case searching:
-                switch (buffer[i]) {
-                case 0x21:
-                    if (dev_flag)
-                        printf("[dev] found an extension\n");
-                    state = extension;
-                    break;
-                case 0x2c:
-                    if (dev_flag)
-                        printf("[dev] found an image descriptor\n");
-                    state = image_descriptor;
-                    scratchpad_i = 0;
-                    scratchpad_len = 0;
-                    break;
-                case 0x3b:
-                    if (dev_flag)
-                        printf("[dev] found the trailer\n");
-                    // if this were a real gif parser you would terminate here
-                    // but i'm speculating that at least one gif
-                    // has been made with comment data coming after
-                    // the trailer as a mistake or easter egg:)~~
-                    state = trailer;
-                    break;
-                default:
-                    if (dev_flag) {
-                        printf("[dev] unknown byte: (0x%x)...\n", buffer[i]);
-                        // void printf_offset(char *str, FILE file, size_t file_buffer_size, int offset);
-                        printf_offset("unknown byte", file, 256, i);
-                    }
-                    break;
-                }
-                break;
-            case extension:
-                scratchpad_i = 0;
-                scratchpad_len = 0;
-                switch (buffer[i]) {
-                    case 0x01:
-                        state = known_extension;
-                        local_extension_type = plain_text;
-                        if (dev_flag)
-                            printf("[dev] found a plain text extension\n");
-                        break;
-                    case 0xff:
-                        state = known_extension;
-                        local_extension_type = application;
-                        if (dev_flag)
-                            printf("[dev] found an application extension\n");
-                        break;
-                    case 0xfe:
-                        state = known_extension;
-                        local_extension_type = comment;
-                        if (dev_flag)
-                            printf("[dev] found a comment extension\n");
-                        break;
-                    default:
-                        scratchpad_i = 0;
-                        scratchpad_len = 0;
-                        state = unknown_extension;
-                        if (dev_flag)
-                            printf("[dev] found an unknown extension\n");
-                        break;
-                }
-                break;
-            case unknown_extension:
-                if (scratchpad_len == 0) {
-                    if (buffer[i] == 0) {
-                        state = searching;
-                        break;
-                    }
-                    scratchpad_len = buffer[i];
-                    scratchpad_i = 0;
-                } else {
-                    if (buffer[i] == 0x0 && scratchpad_i >= scratchpad_len) {
-                        if (dev_flag)
-                            printf("[dev] reached the end of the unknown extension\n");
-                        state = searching;
-                    } else {
-                        scratchpad_i++;
-                    }	
-                }
-                break;
-            case known_extension:
-                // if the scratchpatch len is empty
-                // then must be new block
-                if (scratchpad_len == 0) {
-                    // if the new size of the block is
-                    // zero then terminate
-                    if (buffer[i] == 0) {
-                        state = searching;
-                        if (dev_flag)
-                            printf("[dev] new extension block was empty\n");
-                        break;
-                    }
-                    // else get ready for a new block
-                    scratchpad_len = buffer[i];
-                    scratchpad_i = 0;
-                    if (dev_flag)
-                        printf("[dev] new extension block len: %d\n", scratchpad_len);
-                } else {
-                    if (scratchpad_i < scratchpad_len || (local_extension_type == comment && buffer[i] != 0)) {
-                        // comments must be dealt differently and allowed to exceed previously defined lengths because applications
-                        // sometimes disregard their given size and overload strings beyond 255 bytes
-                        if (local_extension_type == comment && scratchpad_i + 1 >= scratchpad_size) {
-                            scratchpad_size += SCRATCHPAD_CHUNK_SIZE;
-                            if (scratchpad_size > SCRATCHPAD_CHUNK_SIZE * 10) {
-                                // don't go past 2560 bytes of reallocation
-                                free(extension_cb_info);
-                                free(scratchpad);
-                                return GIF_FILE_COMMENT_EXCEEDS_BOUNDS;
-                            }
-                            if (dev_flag)
-                                printf("[dev] reallocated scratchpad to a size of: %ld (* type sizeof)\n", scratchpad_size);
-                            scratchpad = realloc(scratchpad, sizeof(unsigned char) * scratchpad_size);
-                        }
-
-                        scratchpad[scratchpad_i] = buffer[i];
-                        scratchpad_i++;
-                    } else {
-                        scratchpad[scratchpad_i] = '\0';
-                        
-                        if (extension_cb_info) {
-                            extension_cb_info->type = local_extension_type;
-                            extension_cb_info->buffer = scratchpad;
-                            if (local_extension_type == comment) {
-                                extension_cb_info->buffer_len = scratchpad_i;
-                            } else {
-                                extension_cb_info->buffer_len = scratchpad_len;
-                            }
-                            extension_cb(extension_cb_info);
-                        }
-
-                        // for the next byte
-                        if (local_extension_type == application || local_extension_type == application_subblock) {
-                            // subblocks always follow an application
-                            local_extension_type = application_subblock;
-                            scratchpad_i = 0;
-                            scratchpad_len = buffer[i];
-                            
-                            if (scratchpad_len == 0) {
-                                state = searching;
-                                break;
-                            }
-                        } else {
-                            state = searching;
-                        }
-                    }
-                }
-                break;
-            case image_descriptor:
-            
-                if (scratchpad_i >= 8) {
-                    if (dev_flag)
-                        printf("[dev] reached the end of an image descriptor, now parsing\n");
-                    if ((buffer[i] & 0b10000000) == 0b10000000) {
-                        // local color table
-                        scratchpad_i = 0;
-                        int local_color_table = (buffer[i] & 0b100) + (buffer[i] & 0b10) + (buffer[i] & 0b1);
-                        scratchpad_len = 3*pow(2,local_color_table+1);
-                        state = local_color_table;
-                        if (dev_flag)
-                            printf("[dev] image descriptor contains a local color table with length %d\n", scratchpad_len);
-                    } else {
-                        scratchpad_i = 0;
-                        scratchpad_len = 0;
-                        state = image_data;
-                        break;
-                    }
-                } else {
-                    scratchpad_i++;
-                }
-                break;
-            case local_color_table:
-                if (scratchpad_i >= scratchpad_len) {
-                    scratchpad_i = 0;
-                    scratchpad_len = 0;
-                    state = image_data;
-                    if (dev_flag)
-                        printf("[dev] reached the end of the local color table\n");
-                } else {
-                    scratchpad_i++;
-                }
-                break;
-            case image_data:
-                if (scratchpad_len == 0) {
-                    if (scratchpad_i == 1) {
-                        scratchpad_i = 0;
-                        scratchpad_len = buffer[i];
-                        if (dev_flag)
-                            printf("[dev] start of image data blocks, initial block size: %d\n", scratchpad_len);
-                        break;
-                    }
-                } else {
-                    if (scratchpad_i >= scratchpad_len) {
-                        if (buffer[i] == 0x0) {
-                            if (dev_flag)
-                                printf("[dev] reached the end of image data blocks\n");
-                            state = searching;
-                            break;
-                        } else {
-                            scratchpad_i = 0;
-                            scratchpad_len = buffer[i];
-                            if (dev_flag)
-                                printf("[dev] read an image block, next block size: %d\n", scratchpad_len);
-                            break;
-                        }
-                    }
-                }
-                scratchpad_i++;
                 break;
             default:
                 break;
             }
-        }
+            
+            break;
+        case global_color_table:
+            CALL_STATE_CB(state_cb, s);
+            // loop through the global color table, ignoring the contents
+            if (s->color_table_len < s->scratchpad_i) {
+                s->read_state = searching;
+            }
+            s->scratchpad_i++;
+            break;
+        case searching:
+            //CALL_STATE_CB(state_cb, s);
+
+            // the following CALL_STATE_CB are not considered pre-emptive as it
+            // is byte matching, hence marking the actual start of the block
+            switch (byte) {
+            case 0x21:
+                s->read_state = extension;
+                CALL_STATE_CB(state_cb, s);
+                break;
+            case 0x2c:
+                s->read_state = image_descriptor;
+                CALL_STATE_CB(state_cb, s);
+                s->scratchpad_i = 0;
+                s->scratchpad_len = 0;
+                break;
+            case 0x3b:
+                // if this were a real gif parser you would terminate here
+                // but i'm speculating that at least one gif
+                // has been made with comment data coming after
+                // the trailer as a mistake or easter egg
+                s->read_state = trailer;
+                CALL_STATE_CB(state_cb, s);
+                break;
+            default:
+                // unknown byte
+                // again, this has never occured but persists to avoid the potential
+                break;
+            }
+            break;
+        case extension:
+            s->scratchpad_i = 0;
+            s->scratchpad_len = 0;
+            s->read_state = known_extension;
+            switch (byte) {
+                case 0x01:
+                    s->local_extension_type = plain_text;
+                    CALL_STATE_CB(state_cb, s);
+                    break;
+                case 0xff:
+                    s->local_extension_type = application;
+                    CALL_STATE_CB(state_cb, s);
+                    break;
+                case 0xfe:
+                    s->local_extension_type = comment;
+                    CALL_STATE_CB(state_cb, s);
+                    break;
+                default:
+                    s->scratchpad_i = 0;
+                    s->scratchpad_len = 0;
+                    s->read_state = unknown_extension;
+                    CALL_STATE_CB(state_cb, s);
+                    break;
+            }
+            break;
+        case unknown_extension:
+            if (s->scratchpad_len == 0) {
+                if (byte == 0) {
+                    s->read_state = searching;
+                    break;
+                }
+                s->scratchpad_len = byte;
+                s->scratchpad_i = 0;
+            } else {
+                if (byte == 0x0 && s->scratchpad_i >= s->scratchpad_len) {
+                    s->read_state = searching;
+                } else {
+                    s->scratchpad_i++;
+                }   
+            }
+            break;
+        case known_extension:
+            // if the scratchpatch len is empty
+            // then must be new block
+            if (s->scratchpad_len == 0) {
+                // if the new size of the block is
+                // zero then terminate
+                if (byte == 0) {
+                    s->read_state = searching;
+                    break;
+                }
+                // else get ready for a new block
+                s->scratchpad_len = byte;
+                s->scratchpad_i = 0;
+            } else {
+                // comments must be dealt differently and allowed to exceed
+                // previously defined lengths because applications
+                // sometimes disregard their given size and overload
+                // strings beyond 255 bytes
+                //
+                // if bytes to read remaining or is a comment
+                int is_comment = s->local_extension_type == comment && byte != 0;
+                if (s->scratchpad_i < s->scratchpad_len || is_comment) {
+                    // if future bytes will exceed scratchpad size, realloc
+                    if (s->local_extension_type == comment && s->scratchpad_i + 1 >= s->scratchpad_size) {
+                        s->scratchpad_size += GIFMETADATA_SCRATCHPAD_CHUNK_SIZE;
+                        if (s->scratchpad_size > GIFMETADATA_SCRATCHPAD_CHUNK_SIZE * 10) {
+                            // don't go past 2560 bytes of reallocation
+                            //free(extension_cb_info);
+                            return GIFMETADATA_COMMENT_EXCEEDS_BOUNDS;
+                        }
+                        s->scratchpad = realloc(s->scratchpad, s->scratchpad_size);
+                    }
+
+                    s->scratchpad[s->scratchpad_i] = byte;
+                    s->scratchpad_i++;
+                } else {
+                    s->scratchpad[s->scratchpad_i] = 0;
+
+                    if (extension_cb != NULL) {
+                        gifmetadata_extension_info *extension_cb_info = malloc(sizeof(gifmetadata_extension_info));
+                        if (extension_cb_info == NULL) {
+                            return GIFMETADATA_ALLOC_FAILURE;
+                        }
+                        extension_cb_info->type = s->local_extension_type;
+                        extension_cb_info->buffer = s->scratchpad;
+                        // TODO ensure that callback receiver does not
+                        // free scratchpad
+                        if (s->local_extension_type == comment) {
+                            extension_cb_info->buffer_len = s->scratchpad_i;
+                        } else {
+                            extension_cb_info->buffer_len = s->scratchpad_len;
+                        }
+                        // TODO ensure that callback receiver frees struct
+                        extension_cb(s, extension_cb_info);
+                    }
+
+                    // if the next extension type is an application then
+                    // optional sub blocks can follow
+                    if (s->local_extension_type == application || s->local_extension_type == application_subblock) {
+                        s->local_extension_type = application_subblock;
+                        s->scratchpad_i = 0;
+                        s->scratchpad_len = byte;
+                        
+                        if (s->scratchpad_len == 0) {
+                            s->read_state = searching;
+                            break;
+                        }
+                    } else {
+                        s->read_state = searching;
+                    }
+                }
+            }
+            break;
+        case image_descriptor:
         
+            if (s->scratchpad_i >= 8) {
+                // local color table check
+                if (byte >> 7 == 1) {
+                    s->scratchpad_i = 0;
+                    int local_color_table = byte & 0b111;
+                    s->scratchpad_len = 3*pow(2,local_color_table+1);
+                    s->read_state = local_color_table;
+                } else {
+                    s->scratchpad_i = 0;
+                    s->scratchpad_len = 0;
+                    s->read_state = image_data;
+                    break;
+                }
+            } else {
+                s->scratchpad_i++;
+            }
+            break;
+        case local_color_table:
+            CALL_STATE_CB(state_cb, s);
+            // loop through the local color table, ignoring the contents
+            if (s->scratchpad_i >= s->scratchpad_len) {
+                s->scratchpad_i = 0;
+                s->scratchpad_len = 0;
+                s->read_state = image_data;
+            } else {
+                s->scratchpad_i++;
+            }
+            break;
+        case image_data:
+            CALL_STATE_CB(state_cb, s);
+            // loop through the image data, ignoring the contents
+            if (s->scratchpad_len == 0) {
+                if (s->scratchpad_i == 1) {
+                    s->scratchpad_i = 0;
+                    s->scratchpad_len = byte;
+                    break;
+                }
+            } else {
+                if (s->scratchpad_i >= s->scratchpad_len) {
+                    if (byte == 0) {
+                        s->read_state = searching;
+                        break;
+                    } else {
+                        s->scratchpad_i = 0;
+                        s->scratchpad_len = byte;
+                        break;
+                    }
+                }
+            }
+            s->scratchpad_i++;
+            break;
+        default:
+            break;
+        } 
     }
-    free(extension_cb_info);
-    free(scratchpad);
 
-        
-    if (state != trailer)
-        fprintf(stderr, "[warning] file was incompatible and therefore gifpeek may have missed some data, recommended that you view this file in a hex editor to get more information\n");
-
-    return GIF_FILE_SUCCESS;
+    return GIFMETADATA_SUCCESS;
 }

@@ -6,4 +6,6 @@ gifmetadata
 .DS_Store
 *.tar.gz
 *.o
+*.a
+*.core
 examples/
